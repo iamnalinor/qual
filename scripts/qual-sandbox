@@ -1,0 +1,330 @@
+#!/usr/bin/python3 -I
+"""Apply a Linux boundary before starting Qual. No project code runs in preparation."""
+import argparse
+import errno
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import unicodedata
+from urllib.parse import quote
+
+
+class SandboxError(Exception):
+    """An actionable launcher failure, never an invitation to bypass isolation."""
+
+
+def fail(code, message):
+    raise SandboxError(f'{code}: {message}')
+
+
+def selected_file(path):
+    path = Path(path).expanduser().resolve(strict=True)
+    if not path.is_file():
+        fail('sandbox_input', 'selected input must be a regular file')
+    return path
+
+
+def executable(name, *, system_only=False):
+    found = shutil.which(name, path='/usr/bin:/bin' if system_only else None)
+    if not found:
+        fail('sandbox_backend', f'required executable unavailable: {name}')
+    return selected_file(found)
+
+
+def copy_tree(source, target, *, git_metadata=False, exclude=(), overlay=False, select=None, relative=Path()):
+    """Byte copies only: never follow source links, create hardlinks or run git."""
+    target.mkdir(mode=0o700, exist_ok=overlay)
+    for entry in source.iterdir():
+        if entry.name in exclude:
+            continue
+        dest = target / entry.name
+        mode = entry.lstat().st_mode
+        entry_relative = relative / entry.name
+        if select and not select(entry_relative, stat.S_ISDIR(mode)):
+            continue
+        if stat.S_ISLNK(mode):
+            if git_metadata:
+                fail('sandbox_repository', 'symlinks in git metadata are unsupported')
+            dest.symlink_to(os.readlink(entry))
+        elif stat.S_ISDIR(mode):
+            copy_tree(entry, dest, git_metadata=git_metadata, overlay=overlay,
+                      select=select, relative=entry_relative)
+        elif stat.S_ISREG(mode):
+            # O_NOFOLLOW also catches a regular file replaced by a symlink while copying.
+            fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as incoming, dest.open('wb' if overlay else 'xb') as outgoing:
+                shutil.copyfileobj(incoming, outgoing)
+            dest.chmod(stat.S_IMODE(mode) & 0o777)
+        else:
+            fail('sandbox_input', 'special files and sockets are not accepted in input')
+
+
+def validate_toolchain(path):
+    path = path.resolve(strict=True)
+    if not path.is_dir():
+        fail('sandbox_toolchain', 'toolchain must be a trusted directory')
+    for root, directories, files in os.walk(path, followlinks=False):
+        for name in directories + files:
+            mode = (Path(root) / name).lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                fail('sandbox_toolchain', 'toolchains must not contain sockets or special files')
+    return path
+
+
+def git_locations(source):
+    marker = source / '.git'
+    if marker.is_dir() and not marker.is_symlink():
+        gitdir = marker.resolve(strict=True)
+    elif marker.is_file() and not marker.is_symlink():
+        value = marker.read_text().strip()
+        if not value.startswith('gitdir: '):
+            fail('sandbox_repository', 'invalid gitdir marker')
+        gitdir = (source / value[8:]).resolve(strict=True)
+    else:
+        fail('sandbox_repository', '--input must name a git checkout root')
+    common_marker = gitdir / 'commondir'
+    common = (gitdir / common_marker.read_text().strip()).resolve(strict=True) if common_marker.exists() else gitdir
+    if not (gitdir / 'HEAD').is_file() or not (common / 'objects').is_dir():
+        fail('sandbox_repository', 'selected git metadata is incomplete')
+    # Alternates and shallow external object stores must not leak source paths into the copy.
+    if (common / 'objects/info/alternates').exists() or (common / 'objects/info/http-alternates').exists():
+        fail('sandbox_repository', 'git object alternates must be materialized before sandboxing')
+    return gitdir, common
+
+
+def git_metadata_selected(path, directory, *, shared):
+    # Git's common-directory layout: all other entries belong to one worktree.
+    # https://github.com/git/git/blob/v2.43.0/path.c (common_list)
+    common_roots = {'branches', 'common', 'hooks', 'info', 'logs', 'lost-found',
+                    'objects', 'refs', 'remotes', 'rr-cache', 'svn',
+                    'config', 'packed-refs', 'shallow'}
+    private_paths = ('info/sparse-checkout', 'logs/HEAD', 'refs/bisect',
+                     'refs/rewritten', 'refs/worktree', 'logs/refs/bisect',
+                     'logs/refs/rewritten', 'logs/refs/worktree')
+    value = path.as_posix()
+    is_shared = path.parts[0] in common_roots and not any(
+        value == prefix or value.startswith(prefix + '/') for prefix in private_paths)
+    # Traverse mixed directories even when only their descendants are selected.
+    mixed_directory = directory and value in ('info', 'refs', 'logs', 'logs/refs')
+    return is_shared == shared or mixed_directory
+
+
+def copy_repository(source, target, gitdir, common):
+    copy_tree(source, target, exclude=('.git',))
+    common_selection = (lambda path, directory: git_metadata_selected(path, directory, shared=True)) if gitdir != common else None
+    copy_tree(common, target / '.git', git_metadata=True, exclude=('worktrees',), select=common_selection)
+    if gitdir != common:
+        # Copy only this worktree's metadata, so absent files stay absent.
+        copy_tree(gitdir, target / '.git', git_metadata=True, overlay=True,
+                  exclude=('commondir', 'gitdir', 'locked'),
+                  select=lambda path, directory: git_metadata_selected(path, directory, shared=False))
+    for name in ('commondir', 'gitdir'):
+        (target / '.git' / name).unlink(missing_ok=True)
+    # The flattened metadata now belongs to an ordinary independent checkout.
+    # A bare common repository or an absolute worktree override still describes
+    # the host layout. Append relocation overrides without parsing untrusted Git
+    # configuration or invoking Git (which could run fsmonitor) on the host.
+    for name in ('config', 'config.worktree'):
+        config = target / '.git' / name
+        if name == 'config' or config.exists():
+            mode = stat.S_IMODE(config.stat().st_mode) if config.exists() else None
+            if mode is not None:
+                config.chmod(mode | stat.S_IWUSR)
+            try:
+                with config.open('ab') as stream:
+                    stream.write(b'\n[core]\n\tbare = false\n\tworktree = ..\n')
+            finally:
+                if mode is not None:
+                    config.chmod(mode)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, help='git checkout root; omit for URL reviews')
+    parser.add_argument('--output', required=True, type=Path, help='new private directory, retained on failure')
+    parser.add_argument('--network', choices=('none', 'restricted', 'open'), default='none')
+    parser.add_argument('--allow', action='append', default=[], metavar='HOST:PORT', help='exact restricted egress endpoint')
+    parser.add_argument('--qual', default='qual', help='selected executable (never probed outside the boundary)')
+    parser.add_argument('--settings', type=Path, help='explicit user settings copied into separate QUAL_HOME')
+    parser.add_argument('--rules', type=Path, help='explicit context copied to /context/rules.md')
+    parser.add_argument('--credential', action='append', default=[], metavar='NAME=FILE', help='selected credential; file must be owner-only')
+    parser.add_argument('--toolchain', action='append', default=[], type=Path, help='trusted directory mounted read-only at /opt/toolchains/N')
+    parser.add_argument('--runtime-dir', type=Path, default=Path(__file__).resolve().parents[1] / 'sandbox')
+    parser.add_argument('--timeout', type=float, default=3600, help='whole-run deadline in seconds')
+    parser.add_argument('qual_args', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if not args.qual_args or args.qual_args[0] != '--':
+        parser.error('separate Qual arguments with --')
+    args.qual_args = args.qual_args[1:]
+    if not 0 < args.timeout <= 86400:
+        parser.error('--timeout must be in (0, 86400]')
+    if args.allow and args.network != 'restricted':
+        parser.error('--allow requires --network restricted')
+    for host in args.allow:
+        if not re.fullmatch(r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?):[0-9]{1,5}', host):
+            parser.error('--allow requires an exact HOST:PORT, without schemes or wildcards')
+        if not 1 <= int(host.rsplit(':', 1)[1]) <= 65535:
+            parser.error('--allow port is out of range')
+    return args
+
+
+def safe_detail(value, secret_values):
+    text = str(value)
+    credentials = secret_values + [value for name, value in os.environ.items()
+                                  if re.search(r'(KEY|TOKEN|PASSWORD|SECRET|AUTH)$', name, re.I) and value]
+    for secret in sorted({variant for value in credentials for variant in (value, quote(value, safe=''))},
+                         key=len, reverse=True):
+        text = text.replace(secret, '[redacted]')
+    text = re.sub(r'\bBearer\s+[^\s,;]+', 'Bearer [redacted]', text, flags=re.I)
+    text = re.sub(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", '[redacted URL]', text, flags=re.I)
+    text = re.sub(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])', '', text)
+    return ''.join(' ' if unicodedata.category(char) in ('Cc', 'Cf', 'Zl', 'Zp') else char
+                   for char in text)[:4096]
+
+
+def main(secret_values):
+    args = parse_args()
+    if sys.platform != 'linux':
+        fail('sandbox_platform', 'this launcher requires Linux')
+    bwrap, qual = executable('bwrap', system_only=True), executable(args.qual)
+    source = args.input.resolve(strict=True) if args.input else None
+    gitdir, common = git_locations(source) if source else (None, None)
+    if args.output.is_symlink() or args.output.exists():
+        fail('sandbox_output', 'output must be a new directory, not an existing path or symlink')
+    output = args.output.resolve()
+    for protected in (source, gitdir, common):
+        if protected and (output.is_relative_to(protected) or protected.is_relative_to(output)):
+            fail('sandbox_output', 'output and input git storage must not overlap')
+    env = {'PATH': '/opt/qual-tools:/usr/bin:/bin', 'HOME': '/home/qual', 'QUAL_HOME': '/state',
+           'TMPDIR': '/tmp', 'XDG_CACHE_HOME': '/tmp/cache', 'LANG': 'C.UTF-8',
+           'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0',
+           'QUAL_SANDBOX_ACTIVE': '1', 'QUAL_SANDBOX_NETWORK': args.network}
+    for selection in args.credential:
+        name, sep, file = selection.partition('=')
+        if not sep or not re.fullmatch(r'[A-Z][A-Z0-9_]*(?:_API_KEY|_TOKEN)', name):
+            fail('sandbox_credential', 'credential names must end in _API_KEY or _TOKEN')
+        path = selected_file(file)
+        info = path.stat()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            fail('sandbox_credential', 'credential files must be owned by the caller and owner-only')
+        value = path.read_text().rstrip('\r\n')
+        if not value or '\x00' in value or '\n' in value or len(value) > 65536:
+            fail('sandbox_credential', 'credential must contain one nonempty line of at most 64 KiB')
+        env[name] = value
+        secret_values.append(value)
+    toolchains = [validate_toolchain(path) for path in args.toolchain]
+    runtime = args.runtime_dir.resolve(strict=True)
+    tools = []
+    if args.network == 'restricted':
+        tools = [(executable('node'), '/opt/qual-tools/node'), (executable('rg'), '/opt/qual-tools/rg'),
+                 (executable('which'), '/opt/qual-tools/which')]
+        executable('socat')
+        package = runtime / 'node_modules/@anthropic-ai/sandbox-runtime/package.json'
+        if not package.is_file() or json.loads(package.read_text()).get('version') != '0.0.83':
+            fail('sandbox_backend', 'install pinned sandbox dependencies with npm ci --ignore-scripts in sandbox/')
+    output.mkdir(mode=0o700)  # Never reuse a directory or follow an existing output symlink.
+    run = output / '.qual-sandbox'
+    run.mkdir(mode=0o700)
+    for name in ('state', 'context'):
+        (run / name).mkdir(mode=0o700)
+    (output / 'reports').mkdir(mode=0o700)
+    if source:
+        copy_repository(source, run / 'source', gitdir, common)
+    else:
+        (run / 'source').mkdir(mode=0o700)
+    for file, dest in ((args.settings, run / 'state/settings.yaml'), (args.rules, run / 'context/rules.md')):
+        if file:
+            shutil.copyfile(selected_file(file), dest)
+            dest.chmod(0o600)
+    (run / 'invocation.json').write_text(json.dumps({'args': args.qual_args, 'allow': args.allow}))
+    (run / 'invocation.json').chmod(0o600)
+
+    # Start from an empty mount namespace. Never bind /, real home, /run, or source.
+    command = [str(bwrap), '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
+               '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--hostname', 'qual-sandbox']
+    if args.network == 'none':
+        command += ['--unshare-net']
+    for path in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/share/git-core', '/usr/share/ca-certificates', '/etc/ssl/certs'):
+        if Path(path).exists():
+            command += ['--ro-bind', path, path]
+    for path in ('/etc/ld.so.cache', '/etc/nsswitch.conf', '/etc/hosts', '/etc/resolv.conf'):
+        if Path(path).exists():
+            command += ['--ro-bind', path, path]
+    command += ['--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
+                '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/home/qual',
+                '--bind', str(run / 'source'), '/workspace', '--bind', str(run / 'state'), '/state',
+                '--bind', str(output / 'reports'), '/output', '--ro-bind', str(run / 'context'), '/context',
+                '--ro-bind', str(qual), '/opt/qual-tools/qual']
+    for path, dest in tools:
+        command += ['--ro-bind', str(path), dest]
+    for index, path in enumerate(toolchains):
+        dest = f'/opt/toolchains/{index}'
+        command += ['--ro-bind', str(path), dest]
+        env['PATH'] += ':' + dest + '/bin'
+    command += ['--chdir', '/workspace']
+    if args.network == 'restricted':
+        command += ['--ro-bind', str(runtime), '/opt/qual-sandbox', '--ro-bind', str(run / 'invocation.json'), '/invocation.json',
+                    '--', '/opt/qual-tools/node', '/opt/qual-sandbox/restricted.mjs']
+    else:
+        command += ['--disable-userns', '--', '/opt/qual-tools/qual', *args.qual_args]
+    (output / 'sandbox.json').write_text(json.dumps({'network': args.network, 'allow': args.allow,
+                                                    'source': str(source) if source else None,
+                                                    'timeout_seconds': args.timeout}, indent=2) + '\n')
+    print(f'qual-sandbox: network={args.network}; copied input=/workspace; private state=/state; reports={output / "reports"}', file=sys.stderr)
+    if args.network == 'open':
+        print('qual-sandbox: open permits all egress, including host and LAN access', file=sys.stderr)
+    print(f'qual-sandbox: deadline={args.timeout:g}s; CPU/memory limits are not applied', file=sys.stderr)
+    child = subprocess.Popen(command, env=env, close_fds=True, start_new_session=True)
+    interrupted = []
+
+    def cancel(signum, _frame):
+        interrupted.append(signum)
+        os.killpg(child.pid, signal.SIGTERM)
+
+    previous = {sig: signal.signal(sig, cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        try:
+            code = child.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            interrupted.append(signal.SIGTERM)
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+            fail('sandbox_timeout', 'run deadline exceeded; run state and reports retained')
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 128 + interrupted[0] if interrupted else (code if code >= 0 else 128 - code)
+
+
+if __name__ == '__main__':
+    secret_values = []
+    try:
+        sys.exit(main(secret_values))
+    except (SandboxError, OSError, ValueError) as error:
+        # Never echo selected credentials, the environment, or the Qual invocation.
+        if isinstance(error, SandboxError):
+            detail = str(error)
+        elif isinstance(error, OSError):
+            # Retain the failing paths while sanitizing any credential or URL data.
+            code = errno.errorcode.get(error.errno, 'OS_ERROR')
+            reason = error.strerror or type(error).__name__
+            paths = ' -> '.join(str(path) for path in (error.filename, error.filename2) if path is not None)
+            detail = f'sandbox_setup: failed to prepare isolated run: {code}: {reason}'
+            if paths:
+                detail += f': {paths}'
+        elif isinstance(error, json.JSONDecodeError):
+            detail = f'sandbox_setup: invalid JSON: {error.msg} (line {error.lineno}, column {error.colno})'
+        else:
+            detail = f'sandbox_setup: {type(error).__name__}: {error}'
+        print(safe_detail(detail, secret_values), file=sys.stderr)
+        sys.exit(125)

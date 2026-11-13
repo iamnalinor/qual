@@ -1,0 +1,85 @@
+version: "2"
+run:
+  timeout: 5m
+  relative-path-mode: gomod
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - errcheck
+    - errorlint
+    - gosec
+    - bodyclose
+    - noctx
+    - contextcheck
+    - revive
+    - gocritic
+    - unconvert
+    - unparam
+    - exhaustive
+    - depguard
+    - gocyclo
+    - gocognit
+    - funlen
+    - dupl
+    - nolintlint
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocyclo:
+      min-complexity: 11
+    gocognit:
+      min-complexity: 16
+    funlen:
+      lines: 80
+      statements: 40
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    depguard:
+      rules:
+        domain:
+          files: ["**/internal/domain/*.go"]
+          list-mode: strict
+          # Exact package matches prevent effectful stdlib packages and subpackages.
+          # Expand only when a domain value or its pure tests need another import.
+          allow:
+            - "encoding/json$"
+            - "errors$"
+            - "fmt$"
+            - "testing$"
+            - "time$"
+        runtime:
+          files: ["**/internal/runtime/*.go", "!**/*_test.go"]
+          list-mode: strict
+          allow:
+            - "$gostd"
+            - github.com/iamnalinor/qual/internal/domain
+            - github.com/iamnalinor/qual/internal/port
+            # Pure money and finish-contract helpers are shared with runtime.
+            - github.com/iamnalinor/qual/internal/budget
+            - github.com/iamnalinor/qual/internal/report
+        runtime-tests:
+          # Runtime integration fixtures exercise real source and storage adapters.
+          files: ["**/internal/runtime/*_test.go"]
+          list-mode: strict
+          allow:
+            - "$gostd"
+            - github.com/iamnalinor/qual/internal/domain
+            - github.com/iamnalinor/qual/internal/port
+            - github.com/iamnalinor/qual/internal/budget
+            - github.com/iamnalinor/qual/internal/report
+            - github.com/iamnalinor/qual/internal/session
+            - github.com/iamnalinor/qual/internal/gitstore
+  exclusions:
+    presets: []
+    rules:
+      # Real integration scenarios may need longer setup; production limits stay strict.
+      - path: _test\.go$
+        linters: [funlen, dupl]
+formatters:
+  enable: [gofumpt, goimports]

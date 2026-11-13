@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [[ ${QUAL_RUN_LLM:-} != 1 ]]; then
+  echo 'Live tests require QUAL_RUN_LLM=1 and a running budget gate; see tests/live/README.md.' >&2
+  exit 1
+fi
+: "${QUAL_LIVE_GATE_URL:?Set the localhost budget gate URL}"
+: "${QUAL_LIVE_GATE_TOKEN:?Set the limited random gate token}"
+: "${QUAL_LIVE_LEDGER:?Set the absolute existing development ledger path}"
+: "${QUAL_LIVE_ARTIFACT_DIR:?Set a new absolute directory for retained traces and reports}"
+export PATH="$PWD/.tools/bin:$PATH"
+exec go test -tags=llm -count=1 -timeout=15m -v ./tests/live

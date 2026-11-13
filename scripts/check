@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# All tests here are offline. Vulnerability database access is a separate recipe.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+./scripts/lint
+mkdir -p bin artifacts
+go build -trimpath -o bin/qual ./cmd/qual
+go test -race -count=1 -coverprofile=artifacts/coverage.out ./...

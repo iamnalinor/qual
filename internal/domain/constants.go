@@ -1,0 +1,31 @@
+package domain
+
+// Review roles, severity levels, states, and stable diagnostic codes.
+const (
+	RoleSetup                Role      = "setup"
+	RoleReviewer             Role      = "reviewer"
+	RoleLeader               Role      = "leader"
+	SeverityCritical         Severity  = "critical"
+	SeverityImportant        Severity  = "important"
+	SeverityMinor            Severity  = "minor"
+	StatusPending            Status    = "pending"
+	StatusRunning            Status    = "running"
+	StatusCompleted          Status    = "completed"
+	StatusPartial            Status    = "partial"
+	StatusFailed             Status    = "failed"
+	StatusCancelled          Status    = "cancelled"
+	StatusBudgetStopped      Status    = "budget_stopped"
+	StatusStaleSnapshot      Status    = "stale_snapshot"
+	StatusNoChanges          Status    = "no_changes"
+	ErrInvalidConfig         ErrorCode = "invalid_config"
+	ErrAuth                  ErrorCode = "auth"
+	ErrUnsupportedCapability ErrorCode = "unsupported_capability"
+	ErrUnavailableSource     ErrorCode = "unavailable_source"
+	ErrBudget                ErrorCode = "budget"
+	ErrTool                  ErrorCode = "tool"
+	ErrStale                 ErrorCode = "stale"
+	ErrIncomplete            ErrorCode = "incomplete"
+	ErrSourceChanged         ErrorCode = "source_changed"
+	ErrUnmergedIndex         ErrorCode = "unmerged_index"
+	ErrCancelled             ErrorCode = "cancelled"
+)

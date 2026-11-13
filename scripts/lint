@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export PATH="$PWD/.tools/bin:$PATH"
+golangci-lint config verify
+golangci-lint fmt --diff --diff-colored=false
+golangci-lint run
+# Classify extensionless launchers by their shebang; never feed Python to ShellCheck.
+source_dirs=(scripts sandbox)
+if [[ -d tests ]]; then
+  source_dirs+=(tests)
+fi
+shell_files=()
+while IFS= read -r -d '' file; do
+  first_line=$(head -n 1 "$file")
+  case "$first_line:$file" in
+    '#!'*python*:*|*:*.py)
+      PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/qual-pycache" python3 -m py_compile "$file"
+      ;;
+    '#!'*node*:*|*:*.js|*:*.mjs|*:*.cjs)
+      node --check "$file"
+      ;;
+    '#!'*sh*:*|*:*.sh)
+      shell_files+=("$file")
+      ;;
+    '#!'*)
+      echo "Unrecognized executable script interpreter: $file" >&2
+      exit 1
+      ;;
+  esac
+done < <(find "${source_dirs[@]}" -type d -name node_modules -prune -o -type f -print0)
+shellcheck "${shell_files[@]}"
+actionlint -color
+actionlint -color internal/citemplate/templates/github.yml
+./scripts/lint-ci

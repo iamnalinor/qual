@@ -1,0 +1,96 @@
+# Install on the protected default branch. Configure trusted-ref webhooks; see setup.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && ($CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "web")'
+    - when: never
+stages: [authorize, review]
+qual-authorize:
+  stage: authorize
+  image: $QUAL_CI_IMAGE
+  tags: [qual-sandbox]
+  timeout: 40m
+  variables:
+    GIT_STRATEGY: empty
+  script:
+    - |
+      set -eu
+      # Dedicated runner must permit nested user/PID/network namespaces; no fallback.
+      apt-get update
+      apt-get install -y bubblewrap python3 socat ripgrep which git curl ca-certificates
+      test "$CI_COMMIT_REF_PROTECTED" = true
+      test "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH"
+      printf '%s' "$QUAL_SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+      work="$CI_PROJECT_DIR/qual-trusted"
+      mkdir "$work"
+      umask 077
+      curl --fail --silent --show-error --location --header "Authorization: Bearer $QUAL_SOURCE_READ_TOKEN" \
+        "https://api.github.com/repos/iamnalinor/qual/tarball/$QUAL_SOURCE_SHA" -o "$work/qual.tar.gz"
+      mkdir "$work/tool"
+      tar -xzf "$work/qual.tar.gz" -C "$work/tool" --strip-components=1
+      test "$(head -n 1 "$work/tool/go.mod")" = 'module github.com/iamnalinor/qual'
+      # Supply Go 1.27.4 in the trusted runner image; never run an unpinned installer.
+      test "$(go env GOVERSION)" = go1.27.4
+      (cd "$work/tool" && go build -trimpath -o "$work/qual" ./cmd/qual)
+      event_file="$work/event.json"
+      if [ "$CI_PIPELINE_SOURCE" = trigger ]; then
+        test -f "$TRIGGER_PAYLOAD"
+        cp "$TRIGGER_PAYLOAD" "$event_file"
+      else
+        printf '{}' > "$event_file"
+      fi
+      "$work/qual" ci authorize --provider gitlab --event-file "$event_file" \
+        --event "$CI_PIPELINE_SOURCE" --repository "$CI_PROJECT_ID" \
+        --api-url "$CI_API_V4_URL" --actor "$GITLAB_USER_ID" \
+        --number "${QUAL_MR_NUMBER:-0}" --trusted-source > "$work/authorization.json"
+  artifacts:
+    access: developer
+    expire_in: 1 hour
+    paths:
+      - qual-trusted/authorization.json
+      - qual-trusted/qual
+      - qual-trusted/tool/scripts/qual-sandbox
+      - qual-trusted/tool/sandbox/
+qual-review:
+  stage: review
+  image: $QUAL_CI_IMAGE
+  tags: [qual-sandbox]
+  timeout: 40m
+  environment:
+    name: qual-review
+  needs:
+    - job: qual-authorize
+      artifacts: true
+  variables:
+    GIT_STRATEGY: empty
+  script:
+    - |
+      set -eu
+      work="$CI_PROJECT_DIR/qual-trusted"
+      credential_dir=$(mktemp -d)
+      trap 'rm -rf "$credential_dir"' EXIT
+      umask 077
+      # Pass only data through files/environment; no eval or webhook-to-shell expansion.
+      REVIEW_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$work/authorization.json")
+      REVIEW_HEAD=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"])' "$work/authorization.json")
+      REVIEW_TARGET=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target_sha"])' "$work/authorization.json")
+      npm ci --ignore-scripts --prefix "$work/tool/sandbox"
+      # Trusted settings are a protected file variable, not source-branch YAML.
+      printf '%s' "$OPENAI_API_KEY" > "$credential_dir/model"
+      printf '%s' "$GITLAB_TOKEN" > "$credential_dir/platform"
+      unset OPENAI_API_KEY GITLAB_TOKEN QUAL_SOURCE_READ_TOKEN
+      "$work/tool/scripts/qual-sandbox" --qual "$work/qual" \
+        --output "$CI_PROJECT_DIR/qual-output" --network restricted \
+        --allow api.openai.com:443 --allow gitlab.com:443 \
+        --settings "$QUAL_CI_SETTINGS" \
+        --credential "OPENAI_API_KEY=$credential_dir/model" \
+        --credential "GITLAB_TOKEN=$credential_dir/platform" -- \
+        review "$REVIEW_URL" --expected-head "$REVIEW_HEAD" --expected-target "$REVIEW_TARGET" \
+        --non-interactive --output /output
+  artifacts:
+    access: developer
+    when: always
+    expire_in: 7 days
+    paths:
+      - qual-output/reports/
+      - qual-output/.qual-sandbox/state/sessions/
+      - qual-output/sandbox.json

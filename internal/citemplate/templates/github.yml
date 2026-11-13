@@ -1,0 +1,116 @@
+name: Qual review
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      number:
+        description: Pull request number
+        required: true
+        type: number
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  review:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'issue_comment' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Validate administrator-selected source pin
+        env:
+          QUAL_SOURCE_SHA: ${{ vars.QUAL_SOURCE_SHA }}
+        run: '[[ "$QUAL_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Fetch pinned trusted Qual source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: iamnalinor/qual
+          ref: ${{ vars.QUAL_SOURCE_SHA }}
+          token: ${{ secrets.QUAL_SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          path: qual-tool
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.4'
+          cache-dependency-path: qual-tool/go.sum
+      - name: Build pinned trusted tool
+        working-directory: qual-tool
+        run: go build -trimpath -o "$RUNNER_TEMP/qual" ./cmd/qual
+      - name: Authorize initiator and capture immutable commits
+        id: authorize
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUAL_NUMBER: ${{ inputs.number }}
+        run: |
+          "$RUNNER_TEMP/qual" ci authorize --provider github --event-file "$GITHUB_EVENT_PATH" \
+            --event "$GITHUB_EVENT_NAME" --repository "$GITHUB_REPOSITORY" \
+            --api-url "$GITHUB_API_URL" --actor "$GITHUB_ACTOR" \
+            --number "${QUAL_NUMBER:-0}" --trusted-source > "$RUNNER_TEMP/authorization.json"
+          python3 - <<'PY'
+          import json, os
+          with open(os.environ['RUNNER_TEMP'] + '/authorization.json', encoding='utf-8') as f:
+              decision = json.load(f)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              for key in ('url', 'target_sha', 'head_sha'):
+                  value = decision[key]
+                  if '\n' in value or '\r' in value:
+                      raise ValueError('invalid authorization output')
+                  f.write(f'{key}={value}\n')
+          PY
+      - name: Fetch trusted target settings only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.authorize.outputs.target_sha }}
+          persist-credentials: false
+          path: trusted-target
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: qual-tool/sandbox/package-lock.json
+      - name: Provision Linux isolation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3 socat ripgrep which
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          npm ci --ignore-scripts --prefix qual-tool/sandbox
+      - name: Review captured snapshot inside sandbox
+        env:
+          REVIEW_URL: ${{ steps.authorize.outputs.url }}
+          REVIEW_HEAD: ${{ steps.authorize.outputs.head_sha }}
+          REVIEW_TARGET: ${{ steps.authorize.outputs.target_sha }}
+          OPENAI_API_KEY: ${{ secrets.QUAL_OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          credential_dir=$(mktemp -d "$RUNNER_TEMP/qual-credentials.XXXXXX")
+          trap 'rm -rf "$credential_dir"' EXIT
+          printf '%s' "$OPENAI_API_KEY" > "$credential_dir/model"
+          printf '%s' "$GITHUB_TOKEN" > "$credential_dir/platform"
+          unset OPENAI_API_KEY GITHUB_TOKEN
+          qual-tool/scripts/qual-sandbox --qual "$RUNNER_TEMP/qual" \
+            --output "$RUNNER_TEMP/qual-output" --network restricted \
+            --allow api.openai.com:443 --allow api.github.com:443 --allow github.com:443 \
+            --settings trusted-target/.qual/ci-settings.yaml \
+            --credential "OPENAI_API_KEY=$credential_dir/model" \
+            --credential "GITHUB_TOKEN=$credential_dir/platform" -- \
+            review "$REVIEW_URL" --expected-head "$REVIEW_HEAD" --expected-target "$REVIEW_TARGET" \
+            --non-interactive --output /output
+      - name: Retain reports and session traces (no publication)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qual-review-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/qual-output/reports/
+            ${{ runner.temp }}/qual-output/.qual-sandbox/state/sessions/
+            ${{ runner.temp }}/qual-output/sandbox.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

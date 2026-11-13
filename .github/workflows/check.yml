@@ -1,0 +1,113 @@
+name: Offline checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.12.0'
+      - name: Cache pinned verification tools
+        id: tools-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: .tools
+          key: qual-tools-${{ runner.os }}-${{ hashFiles('scripts/bootstrap') }}
+      - name: Install pinned tools
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: ./scripts/bootstrap
+      - name: Lint, build, and race tests
+        run: .tools/bin/just check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: offline-checks
+          path: |
+            bin/qual
+            artifacts/
+          if-no-files-found: error
+          retention-days: 7
+  sandbox:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: sandbox/package-lock.json
+      - name: Provision required namespace and proxy dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3 socat ripgrep which
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          npm ci --ignore-scripts --prefix sandbox
+      - name: Exercise Linux boundary (offline model fixtures)
+        shell: bash
+        run: |
+          mkdir -p artifacts/sandbox
+          ./tests/sandbox/run.sh 2>&1 | tee artifacts/sandbox/boundary.log
+      - name: Retain failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandbox-diagnostics
+          path: artifacts/sandbox/
+          if-no-files-found: warn
+          retention-days: 7
+  binaries:
+    name: Binary ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+      - name: Build and archive executable with checksums
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -buildvcs=true -o dist/qual ./cmd/qual
+          printf 'commit=%s\ngo=%s\ntarget=%s/%s\n' \
+            "$GITHUB_SHA" "$(go env GOVERSION)" "$GOOS" "$GOARCH" > dist/BUILD-INFO.txt
+          cd dist
+          sha256sum qual BUILD-INFO.txt > SHA256SUMS
+          tar -czf "qual-$GOOS-$GOARCH.tar.gz" qual BUILD-INFO.txt SHA256SUMS
+      - name: Upload downloadable binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qual-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/qual-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
